@@ -1,2 +1,2 @@
 # RC-git
-Repor created to make a working demo with RC devs.
+Repo created to make a working demo with RC devs.
