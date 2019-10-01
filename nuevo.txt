@@ -1,0 +1,121 @@
+-- Function: rc.get_eta_tracking(integer)
+
+-- DROP FUNCTION rc.get_eta_tracking(integer);
+
+CREATE OR REPLACE FUNCTION rc.get_eta_tracking(IN _company_id integer)
+  RETURNS TABLE(supply_chain_id integer, stop_id integer, shipment character varying, confirmation character varying, location_name character varying, location_latitude numeric, location_longitude numeric, driver_name text, transline_name character varying, ent_appt_entrance text, eta_date text, last_date text, last_latitude double precision, last_longitude double precision, eta_duration text, eta_distance text, src_location_id integer, src_location_name character varying, src_latitude numeric, src_longitude numeric, vehicle_plate character varying, trailer_plate character varying, finish_tracking text, registered boolean, priority text, address character varying, dst_location_id integer, dst_location_name character varying, app_date text, date_dispatch text, eta_updated text, supplier_name character varying) AS
+$BODY$    
+Declare     
+    _event text;     
+    _event_id int;    
+    _user_time_zone text;    
+    _company_typer rc.company_type;
+    _supplier_id integer;
+BEGIN
+    SELECT u.timezone::text
+    INTO _user_time_zone
+    FROM rc.user As u
+        join rc.company As c on c.company_id = u.company_id
+    WHERE c.company_id = _company_id limit 1;
+
+    -->Buscamos tipo de usuario
+    SELECT _s.supplier_id INTO _supplier_id FROM rc.supplier _s WHERE _s.supplier_id = _company_id;
+    IF NOT FOUND THEN
+	_company_typer = 'LINETRANSP';
+    ELSE 
+	_company_typer = 'SUPPLIER';
+    END IF;
+  
+    --> Enviar evidencias a ePOD
+    _event := rc.config_get_feature_param(_company_id, 'Admin', 'event_name');
+    IF _event is null THEN
+        _event_id := 1; 
+    Else
+        select event_type_id
+        into _event_id
+        from rc.event_type where event_type_name = _event;
+    END IF;    
+    
+    --> REGRESAR CONS|LTA    
+    RETURN QUERY
+    SELECT
+        vw.supply_chain_id,
+        vw.stop_id,
+        vw.shipment,
+        s.confirmation,
+        l.location_name,
+        l.latitude,
+        l.longitude,
+        COALESCE(format('%s %s %s', d.driver_firstname, d.driver_lastname, d.driver_second_lastname), 'Sin Conductor'),
+        coalesce(t.company_name, coalesce(t_d.company_name, COALESCE(unt.alias,'Sin Linea Transportista'))),
+        date_format(a_ent.date),
+        date_format(e.eta_updated + e.duration),
+        date_format(mt.created),
+        mt.latitude,
+        mt.longitude,
+        ROUND(EXTRACT(EPOCH FROM e.duration)/60)::text,
+        e.distance::text,
+        src_l.location_id,
+        src_l.location_name,
+        src_l.latitude,
+        src_l.longitude,
+        COALESCE(scv_t.vehicle_plate,''),
+	COALESCE(scv_v.vehicle_plate ,''),
+        date_format(vw.finish_tracking),
+        (td_ent.track_detail_id is not null),
+        COALESCE(lower(sc.priority::text),'')::text,
+        _scmr.address,
+        dst_l.location_id,
+        dst_l.location_name,
+        date_format(dst_apd.date),
+        COALESCE(date_format(src_ap_d.date,_user_time_zone),date_format(src_ap_ex.date,_user_time_zone)),
+        date_format(e.eta_updated),
+        _c_supplier.company_name
+    FROM rc.vw_current_stop AS vw
+        INNER JOIN rc.supply_chain_company AS scc ON vw.supply_chain_id = scc.supply_chain_id AND scc.type = _company_typer
+        LEFT JOIN rc.company as _c_supp on _c_supp.company_id = scc.company_id
+        INNER JOIN rc.supply_chain sc ON sc.supply_chain_id = vw.supply_chain_id
+        INNER JOIN rc.segment AS dst_sg ON scc.supply_chain_id = dst_sg.supply_chain_id AND dst_sg.stop_id_destiny = vw.stop_id
+        INNER JOIN rc.stop AS s ON vw.stop_id = s.stop_id
+        INNER JOIN rc.location AS l ON vw.location_id = l.location_id
+        LEFT JOIN rc.driver AS d ON vw.driver_id = d.driver_id
+        LEFT JOIN rc.company AS t ON vw.transline_id = t.company_id
+        left join rc.company as t_d on t_d.company_id = d.transline_id
+        LEFT JOIN rc.uncertified_carrier AS unc ON unc.stop_id = s.stop_id
+        LEFT JOIN rc.uncertified_transline AS unt ON unc.uncertified_transline_id=unt.uncertified_transline_id
+        LEFT JOIN rc.appt_detail AS a_ent ON vw.appt_id = a_ent.appt_id AND a_ent.event_type_id = _event_id
+        LEFT JOIN rc.track_detail AS td_ent ON vw.track_id = td_ent.track_id AND td_ent.event_type_id = _event_id
+        LEFT JOIN rc.supply_chain_mobile_resume as _scmr on _scmr.supply_chain_id = vw.supply_chain_id
+        LEFT JOIN rc.eta_mobile_monitor AS e ON vw.supply_chain_id = e.supply_chain_id AND vw.stop_id = e.dst_stop_id
+        LEFT JOIN rc.supply_chain_mobile_tracking as mt on mt.supply_chain_id = _scmr.supply_chain_id and mt.id = _scmr.last_tracking_id
+        LEFT JOIN rc.supply_chain_vehicle as scv_t on scv_t.supply_chain_id = vw.supply_chain_id and scv_t.vehicle_type = 'TRAILER'
+        LEFT JOIN rc.supply_chain_vehicle as scv_v on scv_v.supply_chain_id = vw.supply_chain_id and scv_v.vehicle_type = 'TRUCK'
+        --LEFT JOIN rc.segment AS sg ON vw.supply_chain_id = sg.supply_chain_id
+        LEFT JOIN rc.stop AS src_s ON dst_sg.stop_id_source = src_s.stop_id
+        LEFT JOIN rc.location AS src_l ON src_s.location_id = src_l.location_id
+          
+        INNER JOIN rc.stop AS dst_s ON dst_sg.stop_id_destiny = dst_s.stop_id
+        INNER JOIN rc.location AS dst_l ON dst_s.location_id = dst_l.location_id
+        INNER JOIN rc.appt as dst_ap on dst_s.stop_id = dst_ap.stop_id
+        LEFT JOIN rc.appt as src_ap on src_s.stop_id = src_ap.stop_id
+        INNER JOIN rc.appt_detail as dst_apd on dst_ap.appt_id = dst_apd.appt_id AND dst_apd.event_type_id = _event_id
+        LEFT JOIN rc.appt_detail AS src_ap_d ON dst_ap.appt_id = src_ap_d.appt_id  AND src_ap_d.event_type_id = rc.get_event_type_by_name('DISPATCH')
+        LEFT JOIN rc.appt_detail AS src_ap_ex ON src_ap.appt_id = src_ap_ex.appt_id  AND src_ap_ex.event_type_id = rc.get_event_type_by_name('EXIT')
+        LEFT JOIN rc.company AS _c_supplier  ON _c_supplier.company_id = l.supplier_id
+        LEFT JOIN rc.transline _tl on t.company_id = _tl.transline_id
+                                   and t.company_id = _company_id
+    WHERE    
+        -- TODO: Actualmente solo se busca por compañia
+        scc.company_id = _company_id
+        AND a_ent.date IS NOT null
+        and (
+        	(_tl.transline_id is not null and _company_typer = 'LINETRANSP') or (_company_typer = 'SUPPLIER')
+        )
+    ORDER BY vw.location_id, vw.shipment;
+END
+$BODY$
+  LANGUAGE plpgsql VOLATILE
+  COST 100
+  ROWS 1000;
+ALTER FUNCTION rc.get_eta_tracking(integer)
+  OWNER TO postgres;
